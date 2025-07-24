@@ -2,3 +2,4 @@ streamlit
 pandas
 altair
 plotly
+firebase-admin
