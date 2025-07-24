@@ -3,14 +3,17 @@ import json
 import pandas as pd
 from datetime import datetime, timedelta
 import time
-import altair as alt # We are using Altair for the main chart
+import altair as alt 
+import firebase_admin 
+from firebase_admin import credentials, auth, firestore
 
-# --- Configuration (unchanged) ---
+
+# --- Configuration ---
 DATA_FILE = 'leetcode_sql_tracker_data.json'
 DAILY_GOAL = 25 
 REMINDER_INTERVAL_MINUTES = 30 
 
-# --- Data Loading and Saving Functions (unchanged) ---
+# --- Data Loading and Saving Functions (MOVED save_data_to_firestore HERE) ---
 def load_data():
     """
     Loads daily questions data from a JSON file.
@@ -40,10 +43,24 @@ def load_data():
 
 def save_data(data):
     """Saves daily questions data to a JSON file."""
+    # This original JSON save is now primarily for local testing/initialization if needed
     with open(DATA_FILE, 'w') as f:
         json.dump(data, f, indent=4)
 
-# --- KPI Calculation Function (unchanged) ---
+# --- NEW: Firebase Save Function (MOVED HERE) ---
+# This function saves the user's data to Firestore
+@st.cache_data(ttl=3600) # Apply cache to ensure it's re-run for a save only when needed
+def save_data_to_firestore(user_uid, data_to_save):
+    """Saves the current app data dictionary for a user to Firestore."""
+    if user_uid:
+        doc_ref = db.collection('users').document(user_uid)
+        doc_ref.set(data_to_save) 
+        st.cache_data.clear() # Clear specific caches (e.g., get_user_data_from_firestore)
+        st.success("Progress saved to cloud!")
+    else:
+        st.warning("Cannot save: Not logged in.")
+
+# --- KPI Calculation Function ---
 def calculate_current_streak(data, daily_goal):
     """Calculates the current consecutive streak of meeting the daily goal."""
     today = datetime.now().date()
@@ -78,12 +95,12 @@ def calculate_current_streak(data, daily_goal):
     return streak
 
 
-# --- Initialize Session State for Reminder & App Load Time (unchanged) ---
+# --- Initialize Session State for Reminder & App Load Time ---
 if 'app_load_time' not in st.session_state:
     st.session_state.app_load_time = time.time()
     st.session_state.reminder_triggered = False
 
-# --- Main App Configuration (unchanged) ---
+# --- Main App Configuration ---
 st.set_page_config(
     page_title="LeetCode SQL Tracker",
     page_icon="📊",
@@ -92,7 +109,86 @@ st.set_page_config(
 
 st.title("📊 LeetCode SQL Daily Tracker")
 
-data = load_data()
+data = load_data() # This now refers to the old JSON load function, will be overridden later
+
+# --- Firebase Initialization (MOVED db = firestore.client() OUTSIDE IF BLOCK) ---
+if not firebase_admin._apps:
+    try:
+        cred = credentials.Certificate(dict(st.secrets["firebase"]))
+        firebase_admin.initialize_app(cred)
+    except KeyError:
+        st.error("Firebase secrets not found in .streamlit/secrets.toml!")
+        st.info("Please set up Firebase secrets as guided previously for multi-user functionality.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Error initializing Firebase: {e}")
+        st.stop()
+
+# Initialize Firestore client OUTSIDE the 'if not firebase_admin._apps' block
+# This ensures 'db' is defined on every rerun, but Firebase is only initialized once.
+db = firestore.client() 
+
+
+# --- User Authentication ---
+if 'user_id' not in st.session_state:
+    st.session_state.user_id = None
+if 'user_email' not in st.session_state:
+    st.session_state.user_email = None
+
+with st.sidebar:
+    st.header("🔑 Authentication")
+    if st.session_state.user_id:
+        st.success(f"Logged in as: **{st.session_state.user_email}**")
+        if st.button("Logout", key="logout_btn_sidebar"):
+            st.session_state.user_id = None
+            st.session_state.user_email = None
+            st.success("Logged out successfully. Reloading app...")
+            st.rerun()
+    else:
+        auth_choice = st.radio("Choose action", ["Login", "Sign Up"], key="auth_radio_main")
+        email = st.text_input("Email", key="auth_email_input")
+        password = st.text_input("Password", type="password", key="auth_password_input")
+
+        if auth_choice == "Sign Up":
+            if st.button("Register", key="auth_register_btn"):
+                try:
+                    user = auth.create_user(email=email, password=password)
+                    st.success("Account created successfully! Please log in.")
+                except Exception as e:
+                    st.error(f"Sign up failed: {e}. Check email format or if user already exists.")
+        elif auth_choice == "Login":
+            if st.button("Login", key="auth_login_btn"):
+                try:
+                    user = auth.get_user_by_email(email) 
+                    st.session_state.user_id = user.uid
+                    st.session_state.user_email = user.email
+                    st.success(f"Logged in as {user.email}. Reloading app...")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login failed: {e}. Check email or register.")
+                    st.session_state.user_id = None
+
+        if not st.session_state.user_id:
+            st.info("Please log in or sign up to track your progress.")
+            st.stop()
+
+
+# --- Load User Data from Firestore (after successful authentication) ---
+@st.cache_data(ttl=3600) # Cache data for 1 hour to reduce Firestore reads
+def get_user_data_from_firestore(user_uid):
+    if user_uid:
+        doc_ref = db.collection('users').document(user_uid)
+        doc = doc_ref.get()
+        if doc.exists:
+            return doc.to_dict()
+        else:
+            return {"leetcode_list_url": "https://leetcode.com/problem-list/n7bysmt7/"}
+    return {}
+
+# Overwrite the original load_data function logic for the app's use
+# This line now correctly calls the get_user_data_from_firestore based on login state
+data = get_user_data_from_firestore(st.session_state.user_id)
+
 
 # --- LeetCode Problem List Link (Dynamic from data) ---
 current_leetcode_list_url = data.get("leetcode_list_url", "https://leetcode.com/problem-list/n7bysmt7/")
@@ -147,6 +243,7 @@ df_chart_display['Daily Goal'] = DAILY_GOAL
 df_chart_display['Met Goal'] = df_chart_display['Questions Solved'] >= DAILY_GOAL
 
 df_chart_data_final = df_chart_display.reset_index().rename(columns={'index': 'Date'})
+df_chart_data_final['Date'] = df_chart_data_final['Date'].dt.normalize()
 
 df_chart_melted = df_chart_data_final.melt(
     id_vars=['Date', 'Daily Goal', 'Questions Solved', 'Met Goal'],
@@ -195,6 +292,7 @@ st.markdown("---")
 
 # --- Sidebar for Input & Settings ---
 with st.sidebar:
+    # Log Daily Progress UI
     st.header("✏️ Log Daily Progress")
     today_sidebar = datetime.now().date()
     selected_date = st.date_input("Select Date", today_sidebar, max_value=today_sidebar)
@@ -230,8 +328,7 @@ with st.sidebar:
 
     if st.button("💾 Save Progress"):
         data[date_str] = {"easy": easy_solved, "medium": medium_solved, "hard": hard_solved}
-        save_data(data)
-        st.success(f"Progress saved for {date_str}!")
+        save_data_to_firestore(st.session_state.user_id, data) # Call the Firebase save function
         st.rerun()
 
     st.markdown("---")
@@ -246,7 +343,7 @@ with st.sidebar:
     
     if new_leetcode_list_url != current_leetcode_list_url:
         data["leetcode_list_url"] = new_leetcode_list_url
-        save_data(data)
+        save_data_to_firestore(st.session_state.user_id, data) # Save to Firebase
         st.success("LeetCode list URL updated! Reloading app...")
         st.rerun()
 
@@ -273,30 +370,27 @@ with st.sidebar:
 
 # --- Main Content Area (Dashboard - continued) ---
 
-# --- Altair Chart Visualization (STACKED BARS - REVISED X-AXIS WITH TIMEUNIT) ---
+# --- Altair Chart Visualization (STACKED BARS) ---
 st.subheader(f"📈 Daily SQL Progress (Last {default_days_to_display} Days)")
 
 if df_chart_data_final.empty:
     st.info("No historical data to display for the selected period. Log some questions to see your progress chart!")
 else:
-    # Base chart definition for stacked bars
     base_stacked = alt.Chart(df_chart_melted).encode(
-        # Use 'Date:T' (Temporal) and explicitly define TimeUnit for X-axis for correct grouping
         x=alt.X('Date:T', 
-                timeUnit="yearmonthdate", # Group by day (e.g., "Jul 23")
-                axis=alt.Axis(format="%b %d", title="Date") # Format labels like "Jul 23"
+                timeUnit="yearmonthdate", 
+                axis=alt.Axis(format="%b %d", title="Date")
         ),
-        y=alt.Y('Count:Q', title="Questions Solved", axis=alt.Axis(grid=True, format="d")), # Format Y-axis as integer
-        color=alt.Color('Difficulty:N', # Color by 'Difficulty' field
-                        scale=alt.Scale(domain=['easy', 'medium', 'hard'], range=['#34A853', '#F9AB00', '#EA4335']), # Green, Yellow, Red palette
-                        legend=alt.Legend(title="Difficulty")), # Add a legend for difficulty
-        order=alt.Order('Difficulty_sort_order', sort='ascending') # Ensure consistent stacking order
+        y=alt.Y('Count:Q', title="Questions Solved", axis=alt.Axis(grid=True, format="d")),
+        color=alt.Color('Difficulty:N', 
+                        scale=alt.Scale(domain=['easy', 'medium', 'hard'], range=['#34A853', '#F9AB00', '#EA4335']),
+                        legend=alt.Legend(title="Difficulty")),
+        order=alt.Order('Difficulty_sort_order', sort='ascending')
     )
 
-    # Stacked Bars layer
     stacked_bars_chart = base_stacked.mark_bar().encode(
-        tooltip=[ # Enhanced Tooltip for stacked bars
-            alt.Tooltip('Date:T', format="%b %d", title="Date"), # Keep Date:T for tooltip for formatting
+        tooltip=[
+            alt.Tooltip('Date:T', format="%b %d", title="Date"),
             alt.Tooltip('Difficulty:N', title="Difficulty"),
             alt.Tooltip('Count:Q', title="Solved"),
             alt.Tooltip('Questions Solved:Q', title="Total Daily Solved"),
@@ -304,27 +398,30 @@ else:
         ]
     )
 
-    # Goal line (on top of the stacked bars)
     goal_line_chart = alt.Chart(df_chart_data_final).mark_line(color='#A0A0A0', strokeWidth=2, strokeDash=[5, 5]).encode(
-        # X-axis for line needs to match (Temporal with TimeUnit) for correct overlay
         x=alt.X('Date:T', timeUnit="yearmonthdate"), 
         y=alt.Y('Daily Goal:Q', title="Daily Goal"),
         tooltip=[alt.Tooltip('Daily Goal:Q', title="Goal")]
     )
 
-    # Vertical line for today (dynamic based on current date)
     today_date_for_chart_plain = datetime.now().date() 
-    today_line_data_chart = pd.DataFrame({'Date': [today_date_for_chart_plain]}) # Use plain datetime.date object here too
+    today_line_data_chart = pd.DataFrame({'Date': [today_date_for_chart_plain]})
 
     today_line_chart = alt.Chart(today_line_data_chart).mark_rule(color='#4285F4', strokeWidth=2).encode(
-        # X-axis for vertical line consistent (Temporal with TimeUnit)
-        x=alt.X('Date:T', timeUnit="yearmonthdate", title=""), # Use 'Date:T' with timeUnit
-        tooltip=[alt.Tooltip('Date:T', format="%b %d", title="Today")] # Tooltip still uses Date:T for formatting
+        x=alt.X('Date:T', timeUnit="yearmonthdate", title=""), 
+        tooltip=[alt.Tooltip('Date:T', format="%b %d", title="Today")]
     )
 
-    # Layer all chart elements together
-    final_chart = alt.layer(stacked_bars_chart, goal_line_chart, today_line_chart).interactive() # .interactive() allows zoom/pan
-    st.altair_chart(final_chart, use_container_width=True) # Render the chart
+    final_chart = alt.layer(stacked_bars_chart, goal_line_chart, today_line_chart).interactive()
+    
+    final_chart = final_chart.properties(
+        width='container', 
+        height=400 
+    ).resolve_scale(
+        y='shared' 
+    )
+
+    st.altair_chart(final_chart, use_container_width=True)
 
 # --- Daily Goal Status Section (Upcoming Daily Goals) ---
 st.subheader("🎯 Upcoming Daily Goals")
